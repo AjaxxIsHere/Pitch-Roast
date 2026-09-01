@@ -1,3 +1,8 @@
+
+
+https://github.com/user-attachments/assets/565f27eb-b6d1-4679-a9e7-68ebf73eda74
+
+
 # 🔥 PitchRoast
 
 > **AI-powered cold PR pitch auditor.** Roast, score, redline, and rewrite your outreach before a real editor deletes it.
