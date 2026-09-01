@@ -238,7 +238,7 @@ async def _call_openrouter(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://pitchroast.app",
-        "X-OpenRouter-Title": "PitchRoast",
+        "X-Title": "PitchRoast",
     }
     payload = {
         "model": model,
