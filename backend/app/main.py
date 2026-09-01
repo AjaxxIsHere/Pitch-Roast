@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, HTTPException
+
+logger = logging.getLogger("pitchroast")
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
@@ -76,6 +79,18 @@ async def audit(request: PitchRequest) -> PitchAuditResponse:
     Returns a full audit with roast, 6-dimension scores, redlines, and rewrite.
     """
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    mock_llm = os.environ.get("MOCK_LLM", "").lower()
+
+    logger.info(
+        "[/audit] persona=%s pitch_len=%d api_key_set=%s mock_llm=%s",
+        request.persona.value,
+        len(request.pitch_text),
+        bool(api_key),
+        mock_llm,
+    )
+
+    if not api_key and mock_llm != "true":
+        logger.warning("[/audit] OPENROUTER_API_KEY is empty and MOCK_LLM is not true — API calls will fail!")
 
     try:
         result = await audit_pitch(
@@ -134,4 +149,8 @@ async def audit(request: PitchRequest) -> PitchAuditResponse:
 if __name__ == "__main__":
     import uvicorn
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

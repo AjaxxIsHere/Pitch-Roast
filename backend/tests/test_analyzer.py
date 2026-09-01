@@ -1,7 +1,10 @@
 """PitchRoast analyzer tests — JSON parsing, error handling, and schema validation."""
 
 import json
+import os
 import pytest
+from unittest.mock import AsyncMock, patch, MagicMock
+
 from app.schemas import (
     PitchRequest,
     PitchAuditResponse,
@@ -10,7 +13,16 @@ from app.schemas import (
     AuditErrorResponse,
     EditorPersona,
 )
-from app.services import sanitize_llm_response
+from app.services import (
+    sanitize_llm_response,
+    audit_pitch,
+    RateLimitError,
+    ModelUnavailableError,
+    ParseError,
+    MODEL_POOL,
+    GATEWAY_ERRORS,
+    _build_mock_response,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +47,7 @@ VALID_AUDIT_RESPONSE = {
         {"original": "disrupt the industry", "replacement": "improve onboarding for SaaS teams", "reason": "Vague claim — name the outcome."},
     ],
     "rewritten_pitch": "Hi — EngageAI cuts SaaS onboarding time by 40% using AI-assisted workflows. We recently closed $2M ARR and are launching with 12 design partners. Can I send a 2-min demo?",
-    "model_used": "meta-llama/llama-3.3-70b-instruct:free",
+    "model_used": "test-model",
 }
 
 
@@ -315,3 +327,169 @@ class TestParseAndValidate:
     def test_parse_garbage_fails_validation(self):
         parsed = sanitize_llm_response("not json at all")
         assert parsed is None  # can't even get to validation
+
+
+# ===========================================================================
+# 4. Model Pool & Failover Tests
+# ===========================================================================
+
+
+class TestModelPool:
+    def test_pool_has_six_models(self):
+        assert len(MODEL_POOL) == 6
+
+    def test_pool_starts_with_openrouter_free(self):
+        assert MODEL_POOL[0] == "openrouter/free"
+
+    def test_pool_ends_with_gemini(self):
+        assert MODEL_POOL[-1] == "google/gemini-flash-1.5:free"
+
+    def test_gateway_errors_cover_all_required_codes(self):
+        expected = {502, 503, 504, 520, 521, 522}
+        assert GATEWAY_ERRORS == expected
+
+
+class TestAuditPitchMock:
+    """Test MOCK_LLM=true safety hatch."""
+
+    @pytest.mark.asyncio
+    async def test_mock_mode_techcrunch(self):
+        with patch.dict(os.environ, {"MOCK_LLM": "true"}):
+            result = await audit_pitch(
+                pitch_text="A" * 50,
+                persona="techcrunch",
+            )
+            assert result.model_used == "mock"
+            assert result.persona == "TechCrunch Sarah"
+            assert len(result.scores) == 6
+
+    @pytest.mark.asyncio
+    async def test_mock_mode_roastbot(self):
+        with patch.dict(os.environ, {"MOCK_LLM": "true"}):
+            result = await audit_pitch(
+                pitch_text="A" * 50,
+                persona="roastbot",
+            )
+            assert result.model_used == "mock"
+            assert result.persona_avatar == "🔥"
+
+    @pytest.mark.asyncio
+    async def test_mock_mode_all_personas(self):
+        with patch.dict(os.environ, {"MOCK_LLM": "true"}):
+            for persona in ("techcrunch", "forbes", "the_verge", "gulf_news", "roastbot"):
+                result = await audit_pitch(pitch_text="A" * 50, persona=persona)
+                assert result.model_used == "mock"
+                assert len(result.scores) == 6
+
+    @pytest.mark.asyncio
+    async def test_mock_mode_disabled_by_default(self):
+        """Without MOCK_LLM=true, should NOT use mock."""
+        with patch.dict(os.environ, {"MOCK_LLM": ""}, clear=False):
+            with patch("app.services._call_openrouter", new_callable=AsyncMock) as mock_call:
+                mock_call.return_value = json.dumps(VALID_AUDIT_RESPONSE)
+                await audit_pitch(pitch_text="A" * 50, persona="techcrunch")
+                mock_call.assert_called_once()
+
+
+class TestBuildMockResponse:
+    def test_returns_valid_pitch_audit_response(self):
+        resp = _build_mock_response("techcrunch", "A" * 50)
+        assert isinstance(resp, PitchAuditResponse)
+        assert resp.model_used == "mock"
+
+    def test_unknown_persona_falls_back_to_roastbot(self):
+        resp = _build_mock_response("unknown_persona", "A" * 50)
+        assert resp.persona_avatar == "🔥"
+
+
+class TestAuditPitchFailover:
+    """Test the multi-model failover logic in audit_pitch."""
+
+    @pytest.mark.asyncio
+    async def test_immediate_failover_on_503(self):
+        """503 from first model should immediately try next model."""
+        call_count = 0
+
+        async def mock_call(messages, model, api_key=""):
+            nonlocal call_count
+            call_count += 1
+            if model == MODEL_POOL[0]:
+                raise ModelUnavailableError(f"{model} returned 503")
+            # Second model succeeds
+            return json.dumps(VALID_AUDIT_RESPONSE)
+
+        with patch("app.services._call_openrouter", side_effect=mock_call):
+            result = await audit_pitch(pitch_text="A" * 50, persona="techcrunch")
+            assert result.overall_score == 3.5
+            assert call_count == 2  # first failed, second succeeded
+
+    @pytest.mark.asyncio
+    async def test_immediate_failover_on_502(self):
+        """502 from first model should immediately try next model."""
+        async def mock_call(messages, model, api_key=""):
+            if model == MODEL_POOL[0]:
+                raise ModelUnavailableError(f"{model} returned 502")
+            return json.dumps(VALID_AUDIT_RESPONSE)
+
+        with patch("app.services._call_openrouter", side_effect=mock_call):
+            result = await audit_pitch(pitch_text="A" * 50, persona="techcrunch")
+            assert result.overall_score == 3.5
+
+    @pytest.mark.asyncio
+    async def test_immediate_failover_on_504(self):
+        """504 from first model should immediately try next model."""
+        async def mock_call(messages, model, api_key=""):
+            if model == MODEL_POOL[0]:
+                raise ModelUnavailableError(f"{model} returned 504")
+            return json.dumps(VALID_AUDIT_RESPONSE)
+
+        with patch("app.services._call_openrouter", side_effect=mock_call):
+            result = await audit_pitch(pitch_text="A" * 50, persona="techcrunch")
+            assert result.overall_score == 3.5
+
+    @pytest.mark.asyncio
+    async def test_all_models_fail_raises(self):
+        """If all models fail, should raise ModelUnavailableError."""
+        async def mock_call(messages, model, api_key=""):
+            raise ModelUnavailableError(f"{model} unavailable")
+
+        with patch("app.services._call_openrouter", side_effect=mock_call):
+            with pytest.raises(ModelUnavailableError):
+                await audit_pitch(pitch_text="A" * 50, persona="techcrunch")
+
+    @pytest.mark.asyncio
+    async def test_parse_error_retries_then_falls_through(self):
+        """Parse error should retry then fall through to next model."""
+        call_count = 0
+
+        async def mock_call(messages, model, api_key=""):
+            nonlocal call_count
+            call_count += 1
+            if model == MODEL_POOL[0]:
+                return "not json at all"
+            return json.dumps(VALID_AUDIT_RESPONSE)
+
+        with patch("app.services._call_openrouter", side_effect=mock_call):
+            result = await audit_pitch(pitch_text="A" * 50, persona="techcrunch")
+            assert result.overall_score == 3.5
+            # First model retried MAX_RETRIES+1 times, then second model called once
+            from app.services import MAX_RETRIES
+            assert call_count == (MAX_RETRIES + 1) + 1
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_retries_with_backoff(self):
+        """Rate limit should retry with backoff, then fall through."""
+        call_count = 0
+
+        async def mock_call(messages, model, api_key=""):
+            nonlocal call_count
+            call_count += 1
+            if model == MODEL_POOL[0]:
+                raise RateLimitError(retry_after=1)
+            return json.dumps(VALID_AUDIT_RESPONSE)
+
+        with patch("app.services._call_openrouter", side_effect=mock_call):
+            result = await audit_pitch(pitch_text="A" * 50, persona="techcrunch")
+            assert result.overall_score == 3.5
+            from app.services import MAX_RETRIES
+            assert call_count == (MAX_RETRIES + 1) + 1
